@@ -1,0 +1,107 @@
+<?php
+
+namespace App\Http\Livewire\Withdrawal\Request;
+
+use App\Http\Traits\CodeGeneration;
+use App\Models\CommissionWithdrawal;
+use App\Models\TokenWithdrawal;
+use Bavix\Wallet\Exceptions\BalanceIsEmpty;
+use Bavix\Wallet\Exceptions\InsufficientFunds;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Validator;
+use Illuminate\Validation\ValidationException;
+use Livewire\Component;
+
+class Token extends Component
+{
+    use CodeGeneration;
+    public $amount;
+    public $setAmount = 0;
+    public $balance;
+    public $minimum = 20;
+    public $tax = .10;
+    public $systemFee = 2.5;
+    public $taxAmount = 0;
+    public $netAmount = 0;
+    public $accountNumber;
+    public $selectedBank = 'USDT';
+    public $banks = ['USDT', 'BUSD'];
+
+    public function render()
+    {
+        $this->systemFee = $this->setSystemFee();
+        $this->balance = number_format(Auth::User()->getWallet('token-wallet')->balanceFloat,2);
+        return view('livewire.withdrawal.request.token');
+    }
+
+    public function updatedAmount()
+    {
+        $this->resetValidation();
+        $this->resetExcept('amount');
+        $user = Auth::User();
+        Validator::make([
+            'amount' => $this->amount,
+        ], [
+            'amount' => ['required', 'numeric', 'min:' . $this->minimum, 'max:' . $user->getWallet('token-wallet')->balanceFloat],
+        ], [
+            'amount.max' => 'You do not have ennough balance.'
+        ])->validate();
+
+        $this->setAmount = number_format($this->amount, 2);
+        $this->systemFee = $this->setSystemFee();
+        $this->netAmount = number_format($this->amount - (($this->amount * $this->tax) + $this->systemFee), 2);
+        $this->taxAmount = number_format($this->amount * $this->tax, 2);
+    }
+
+    private function setSystemFee()
+    {
+        return ($this->amount >= $this->minimum) ? $this->systemFee : 0.00;
+    }
+
+    public function submit()
+    {
+        $user = Auth::User();
+        Validator::make([
+            'amount' => $this->amount,
+            'selectedBank' => $this->selectedBank,
+            'accountNumber' => $this->accountNumber,
+        ], [
+            'amount' => ['required', 'numeric', 'min:' . $this->minimum, 'max:' . $user->getWallet('token-wallet')->balanceFloat],
+            'selectedBank' => ['required'],
+            'accountNumber' => ['required', 'string', 'min:5'],
+        ], [
+            'amount.max' => 'You do not have ennough balance.'
+        ])->validate();
+        DB::beginTransaction();
+        try {
+            $user->getWallet('token-wallet')->refreshBalance();
+            $user->getWallet('token-wallet')->withdrawFloat($this->amount);
+            // $user->withdrawFloat(10000000);
+            // dd($this->netAmount);
+            $cw = TokenWithdrawal::create([
+                'code' => $this->generateCode('token_withdrawals'),
+                'user_code' => $user->code,
+                'description' => 'Request',
+                'account_no' => $this->accountNumber,
+                'bank_name' => $this->selectedBank,
+                'amount' => $this->amount,
+                'tax' => $this->taxAmount,
+                'system_fee' => $this->systemFee,
+                'net_amount' => $this->netAmount,
+            ]);
+            DB::commit();
+            return redirect()->route('receiptToken', ['code' => $cw->code]);
+            $this->reset();
+        } catch (InsufficientFunds $e) {
+            DB::rollBack();
+            throw ValidationException::withMessages(['amount' => $e->getMessage()]);
+        } catch (BalanceIsEmpty $e) {
+            DB::rollBack();
+            throw ValidationException::withMessages(['amount' => $e->getMessage()]);
+        } catch (\Throwable $th) {
+            DB::rollBack();
+            throw $th;
+        }
+    }
+}
